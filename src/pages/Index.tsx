@@ -1,12 +1,34 @@
-// Update this page (the content is just a fallback if you fail to update the page)
+import QuantumGrid from '@/components/ui/QuantumGrid';
+import Navbar from '@/components/layout/Navbar';
+import HeroSection from '@/components/sections/HeroSection';
+import DreamspacesSection from '@/components/sections/DreamspacesSection';
+import ObservabilitySection from '@/components/sections/ObservabilitySection';
+import SecuritySection from '@/components/sections/SecuritySection';
+import ArchitectureSection from '@/components/sections/ArchitectureSection';
+import EconomySection from '@/components/sections/EconomySection';
+import Footer from '@/components/layout/Footer';
 
 const Index = () => {
   return (
-    <div className="flex min-h-screen items-center justify-center bg-background">
-      <div className="text-center">
-        <h1 className="mb-4 text-4xl font-bold">Welcome to Your Blank App</h1>
-        <p className="text-xl text-muted-foreground">Start building your amazing project here!</p>
-      </div>
+    <div className="relative min-h-screen">
+      {/* Quantum Particle Background */}
+      <QuantumGrid />
+      
+      {/* Navigation */}
+      <Navbar />
+      
+      {/* Main Content */}
+      <main>
+        <HeroSection />
+        <DreamspacesSection />
+        <ObservabilitySection />
+        <SecuritySection />
+        <ArchitectureSection />
+        <EconomySection />
+      </main>
+      
+      {/* Footer */}
+      <Footer />
     </div>
   );
 };
