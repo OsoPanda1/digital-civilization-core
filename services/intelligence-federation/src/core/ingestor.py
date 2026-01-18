@@ -1,155 +1,150 @@
-"""
-TAMV Sovereign Ingestor - Production Core
-Blindaje de integridad para el Ledger Civilizatorio.
-"""
-
-import hashlib
 import json
-import logging
+import hashlib
+import uuid
+import structlog
 from datetime import datetime, timezone
-from uuid import uuid4
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, Any, Optional
 
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.exc import SQLAlchemyError, IntegrityError
-from sqlalchemy import select
+from sqlalchemy import select, desc, func
+from sqlalchemy.exc import SQLAlchemyError
 
-# Asumiendo que el modelo profesional anterior está en .models
-from ..models.sovereign_event import TAMVCrumEntity, RiskLevel, VerificationLevel
+from ..models.sovereign_event import TAMVCrumEntity, RiskLevel
+from ..security.anubis import AnubisSentinel
 
-# Configuración de Logging Estructurado
-logger = logging.getLogger("tamv.ingestor")
+logger = structlog.get_logger("tamv.ingestor")
+
+class IntegrityError(Exception):
+    """Falla crítica: La cadena de bloques del Ledger ha sido alterada."""
+    pass
 
 class SovereignIngestor:
-    """
-    Motor de ingesta inmutable. 
-    Asegura que cada bit de información esté vinculado criptográficamente 
-    al Creador antes de tocar el disco.
-    """
-
-    def __init__(self, db_session: AsyncSession) -> None:
-        self.db = db_session
+    def __init__(self, db: AsyncSession, redis: Redis, sentinel: AnubisSentinel):
+        self.db = db
+        self.redis = redis
+        self.sentinel = sentinel
+        self.genesis_hash = "0" * 128  # SHA3-512 Initial State
 
     async def commit_crum(
         self,
-        payload: Dict[str, Any],
+        raw_data: Dict[str, Any],
+        agent_profile: Dict[str, Any],
         creator_ctx: Dict[str, Any],
-        verification_source: VerificationLevel = VerificationLevel.BASIC
+        verified_by_root: bool = False,
     ) -> str:
-        """
-        Punto de entrada único para la persistencia soberana.
-        """
+        log = logger.bind(
+            trace_id=agent_profile.get("trace_id"),
+            action=raw_data.get("action"),
+            ip=agent_profile.get("ip"),
+            creator=creator_ctx.get("did"),
+        )
+
         try:
-            # 1. Validación de Contrato de Datos
-            self._validate_inputs(payload, creator_ctx)
-            
-            # 2. Saneamiento y Normalización
-            safe_payload = self._sanitize(payload)
-            risk = self._resolve_risk(safe_payload)
-            
-            # 3. Generación de Identidad y Huella (Fingerprint)
-            pubkey = creator_ctx["pubkey"]
-            did = creator_ctx["did"]
-            fingerprint = self._generate_fingerprint(pubkey, did)
+            # 1. Verificación de cadena
+            if not await self._verify_chain_link():
+                await self._trigger_emergency_protocol(
+                    reason="CHAIN_BREACH_DETECTED",
+                    severity=100.0,
+                    source="LEDGER_INTEGRITY",
+                )
+                raise IntegrityError("CRITICAL: Ledger chain link is broken. Ingestion halted.")
 
-            # 4. Cálculo de Integridad de Cadena (Merkle Root Link)
-            # Obtenemos el hash del último evento para encadenar (Inmutabilidad)
-            parent_hash = await self._get_last_integrity_hash()
-            integrity_hash = self._compute_integrity_hash(safe_payload, did, parent_hash)
+            # 2. Recuperar último hash
+            last_crum = await self._fetch_last_crum()
+            previous_hash = last_crum.integrity_hash if last_crum else self.genesis_hash
 
-            # 5. Construcción de Entidad Profesional
+            # 3. Construcción criptográfica
+            crum_id = str(uuid.uuid4())
+            timestamp = datetime.now(timezone.utc)
+            payload_json = json.dumps(raw_data, sort_keys=True, separators=(",", ":"))
+            salt = agent_profile.get("trace_id", "") + str(uuid.uuid4())
+            checksum_context = f"{crum_id}|{previous_hash}|{payload_json}|{timestamp.isoformat()}|{salt}"
+            integrity_hash = hashlib.sha3_512(checksum_context.encode("utf-8")).hexdigest()
+
+            # 4. Preparar entidad
             new_crum = TAMVCrumEntity(
-                id=uuid4(),
-                canonical_id=f"TAMV-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{uuid4().hex[:8]}",
-                action_type=safe_payload.get("action", "undefined").upper(),
-                
-                # Soberanía
-                creator_did=did,
-                creator_pubkey=pubkey,
-                creator_signature=creator_ctx["signature"],
-                creator_fingerprint=fingerprint,
-                is_verified_by_root=(verification_source == VerificationLevel.ROOT),
-                
-                # Integridad
+                id=crum_id,
+                canonical_id=f"TAMV-{timestamp.strftime('%Y%m%d')}-{crum_id[:8]}",
+                action_type=raw_data.get("action", "UNDEFINED"),
+                payload=raw_data,
+                agent_metadata=agent_profile,
+                creator_did=creator_ctx.get("did"),
+                creator_signature=creator_ctx.get("signature"),
                 integrity_hash=integrity_hash,
-                parent_hash=parent_hash,
-                
-                # Riesgo y Seguridad
-                risk_level=risk,
-                verification_level=verification_source,
-                quantum_signature=payload.get("quantum_sig"),
-                
-                # Telemetría
-                telemetry_data=payload.get("telemetry", {}),
-                ecg_intensity=self._clamp(payload.get("ecg_intensity"), 0.0, 1.0),
-                ecg_entropy=self._clamp(payload.get("ecg_entropy"), 0.0, 1.0),
-                ecg_pattern=payload.get("ecg_pattern", "stable"),
-                
-                # Datos
-                payload=safe_payload,
-                context_tags=payload.get("tags", []),
-                device_id=creator_ctx.get("device_id"),
-                session_id=creator_ctx.get("session_id")
+                previous_hash=previous_hash,
+                risk_level=(raw_data.get("risk") or RiskLevel.LOW).upper(),
+                verified_by_root=verified_by_root,
+                created_at=timestamp,
+                non_repudiation_token=f"TAMV-CERT-{crum_id[:8]}",
             )
 
-            # 6. Transacción Atómica
+            # 5. Persistencia
             self.db.add(new_crum)
+            await self.db.flush()
             await self.db.commit()
-            
-            logger.info(f"CRUM_COMMITTED: {new_crum.canonical_id} | Risk: {risk} | Integrity: {integrity_hash[:12]}")
-            return str(new_crum.id)
 
-        except IntegrityError:
+            log.info("crum_anchored_successfully", crum_id=crum_id, hash=integrity_hash[:16])
+            await self.sentinel.log_attempt(agent_profile.get("ip", "unknown"), success=True)
+
+            return crum_id
+
+        except SQLAlchemyError as db_err:
             await self.db.rollback()
-            logger.error("INTEGRITY_COLLISION: Hash duplicado o violación de cadena.")
-            raise ValueError("Collision detected in sovereign chain.")
+            log.error("ledger_persistence_error", error=str(db_err))
+            await self.sentinel.log_attempt(agent_profile.get("ip", "unknown"), success=False, reason="DB_ERROR")
+            raise db_err
         except Exception as e:
             await self.db.rollback()
-            logger.critical(f"INGESTION_FAILED: {str(e)}")
-            raise
+            log.critical("ingestor_unhandled_exception", error=str(e))
+            await self.sentinel.emergency_shutdown_trigger(agent_profile.get("ip", "unknown"))
+            raise e
 
-    def _validate_inputs(self, payload: Dict, ctx: Dict):
-        """Validación de esquema mínima requerida."""
-        required_ctx = ["did", "pubkey", "signature"]
-        if not all(k in ctx for k in required_ctx):
-            raise ValueError(f"Missing security context: {required_ctx}")
-        if "action" not in payload:
-            raise ValueError("Payload must define an action_type")
-
-    def _sanitize(self, data: Dict) -> Dict:
-        """Elimina ruido y datos sensibles del payload."""
-        blacklist = {"password", "token", "secret", "private_key"}
-        return {k: v for k, v in data.items() if k.lower() not in blacklist}
-
-    def _resolve_risk(self, payload: Dict) -> RiskLevel:
-        """Lógica de clasificación de riesgo de última instancia."""
-        action = payload.get("action", "").lower()
-        if any(word in action for word in ["delete", "purge", "withdraw", "root"]):
-            return RiskLevel.CRITICAL
-        if any(word in action for word in ["update", "transfer"]):
-            return RiskLevel.HIGH
-        return RiskLevel.LOW
-
-    def _compute_integrity_hash(self, payload: Dict, did: str, parent: Optional[str]) -> str:
-        """Genera un hash SHA-3 512 encadenado."""
-        content = json.dumps(payload, sort_keys=True)
-        salt = f"{did}|{parent or 'GENESIS'}"
-        return hashlib.sha3_512(f"{content}{salt}".encode()).hexdigest()
-
-    def _generate_fingerprint(self, pubkey: str, did: str) -> str:
-        """Fingerprint determinista para búsquedas rápidas."""
-        return hashlib.blake2b(f"{pubkey}{did}".encode(), digest_size=16).hexdigest()
-
-    async def _get_last_integrity_hash(self) -> Optional[str]:
-        """Obtiene el último hash de la tabla para el encadenamiento."""
-        result = await self.db.execute(
-            select(TAMVCrumEntity.integrity_hash).order_by(TAMVCrumEntity.created_at.desc()).limit(1)
-        )
+    async def _fetch_last_crum(self) -> Optional[TAMVCrumEntity]:
+        stmt = select(TAMVCrumEntity).order_by(desc(TAMVCrumEntity.created_at)).limit(1)
+        result = await self.db.execute(stmt)
         return result.scalar_one_or_none()
 
-    @staticmethod
-    def _clamp(val: Any, min_v: float, max_v: float) -> float:
-        try:
-            return max(min_v, min(max_v, float(val)))
-        except (TypeError, ValueError):
-            return 0.0
+    async def _verify_chain_link(self) -> bool:
+        stmt = select(TAMVCrumEntity).order_by(desc(TAMVCrumEntity.created_at)).limit(2)
+        result = await self.db.execute(stmt)
+        records = result.scalars().all()
+
+        if len(records) < 2:
+            return True
+
+        current, previous = records[0], records[1]
+        if current.previous_hash != previous.integrity_hash:
+            logger.error(
+                "chain_link_mismatch",
+                current_id=current.id,
+                expected=previous.integrity_hash,
+                got=current.previous_hash,
+            )
+            return False
+        return True
+
+    async def _trigger_emergency_protocol(self, reason: str, severity: float, source: str):
+        event_payload = {
+            "status": "CRITICAL",
+            "threatLevel": severity,
+            "lastEvent": f"SECURITY_BREACH: {reason} at {source}",
+            "timestamp": datetime.now(timezone.utc).timestamp(),
+        }
+        await self.redis.publish("anubis:crisis_channel", json.dumps(event_payload))
+        await self.sentinel.log_attempt("INTERNAL_SYSTEM", success=False, reason=reason)
+        logger.critical("EMERGENCY_PROTOCOL_ACTIVATED", **event_payload)
+
+    async def get_sovereign_stats(self) -> Dict[str, Any]:
+        count_stmt = select(func.count(TAMVCrumEntity.id))
+        res = await self.db.execute(count_stmt)
+        total_crums = res.scalar() or 0
+        last_crum = await self._fetch_last_crum()
+
+        return {
+            "ledger_height": total_crums,
+            "integrity_status": "SECURE" if await self._verify_chain_link() else "BROKEN",
+            "last_sync": datetime.now(timezone.utc).isoformat(),
+            "last_crum_id": last_crum.id if last_crum else None,
+            "last_hash": last_crum.integrity_hash if last_crum else None,
+        }
