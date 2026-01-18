@@ -1,0 +1,8 @@
+packages:
+  - 'apps/*'
+  - 'services/*'
+  - 'platform/*'
+  - 'libs/*'
+  - 'infra/*'
+  - 'economy/*'
+  - 'governance/*'
