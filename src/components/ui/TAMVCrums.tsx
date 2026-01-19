@@ -1,12 +1,25 @@
-import React, { useMemo } from 'react';
+import React from 'react';
 import { motion } from 'framer-motion';
 import { Activity, Brain, Target, Zap } from 'lucide-react';
-import { clsx, type ClassValue } from 'clsx';
-import { twMerge } from 'tailwind-merge';
+import { cn } from '@/lib/utils';
 
-// Helper para unir clases de Tailwind
-function cn(...inputs: ClassValue[]) {
-  return twMerge(clsx(inputs));
+// Tipos para TAMV Crums
+type EcgPattern = "focused" | "stable" | "overloaded" | "scattered";
+
+interface EcgContext {
+  pattern: EcgPattern;
+  intensity: number;
+}
+
+interface Impact {
+  credits: number;
+}
+
+interface TAMVCrum {
+  id: string;
+  module: string;
+  ecgContext: EcgContext;
+  impact: Impact;
 }
 
 interface TAMVCrumsProps {
@@ -77,3 +90,5 @@ export const TAMVCrums: React.FC<TAMVCrumsProps> = ({ crums, onCrumClick }) => {
     </nav>
   );
 };
+
+export type { TAMVCrum, EcgPattern, EcgContext, Impact };
