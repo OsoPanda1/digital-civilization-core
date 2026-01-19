@@ -33,7 +33,7 @@
   "scripts": {
     "// core pipeline": "–––– monorepo orchestration via Turborepo ––––",
     "dev": "turbo run dev --parallel",
-    "build": "turbo run build",
+    "build:dev": "vite build --mode development",
     "preview": "turbo run preview",
     "lint": "turbo run lint",
     "type-check": "turbo run type-check",
